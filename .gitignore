@@ -1,0 +1,21 @@
+# Large generated data: maps, point clouds, databases, captured sessions
+maps/
+snaps/
+shots/
+*.db
+*.ply
+*.npy
+*_cloud.ply
+*_world.html
+*_model.html
+*_bw.html
+
+# Poster working files (keep poster.html and its small assets)
+poster/poster_preview.png
+
+# Misc
+__pycache__/
+*.pyc
+camera_color.png
+camera_depth.png
+poster/

@@ -1,0 +1,162 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>3D World</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+html,body{margin:0;height:100%;background:#000;overflow:hidden;font-family:system-ui,sans-serif;color:#ddd}
+#hud{position:fixed;left:12px;top:10px;font-size:13px;line-height:1.6;background:rgba(0,0,0,.55);
+     padding:10px 12px;border-radius:8px;user-select:none;max-width:260px}
+#hud label{display:block}
+button{font:inherit;color:#fff;background:#2b6cff;border:0;border-radius:6px;padding:5px 10px;margin:4px 4px 0 0;cursor:pointer}
+button.off{background:#444}
+button.warn{background:#8a2b2b}
+#list{margin-top:8px;max-height:200px;overflow:auto;font-variant-numeric:tabular-nums}
+#list div{border-top:1px solid #333;padding:3px 0}
+.lbl{position:fixed;transform:translate(-50%,-130%);background:rgba(255,170,0,.95);color:#000;font-weight:600;
+     font-size:13px;padding:2px 7px;border-radius:10px;pointer-events:none;white-space:nowrap}
+#cross{position:fixed;width:18px;height:18px;margin:-9px 0 0 -9px;border:2px solid #ffb000;border-radius:50%;
+       pointer-events:none;display:none}
+body.measure canvas{cursor:crosshair}
+</style></head><body>
+<div id="hud">
+  <b>3D World</b> &mdash; __N__ points<br>
+  drag: orbit &middot; wheel: zoom &middot; right-drag: pan
+  <div>
+    <button id="mbtn" class="off">Measure: off</button>
+    <button id="undo">Undo</button>
+    <button id="clear" class="warn">Clear</button>
+  </div>
+  <div id="help" style="display:none;color:#ffb000">Click point A, then point B. Orbit still works (drag).</div>
+  <div id="list"></div>
+  <label>point size <input id="ps" type="range" min="1" max="8" step="0.5" value="4"></label>
+  <label>depth fade <input id="fog" type="range" min="0" max="1" step="0.05" value="0"></label>
+</div>
+<div id="cross"></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+<script>
+function b64(s){const b=atob(s),a=new Uint8Array(b.length);for(let i=0;i<b.length;i++)a[i]=b.charCodeAt(i);return a;}
+// Positions are in METERS (RTAB-Map is metric); axes: x right, y up, z toward viewer.
+const pos=new Float32Array(b64("__POS__").buffer), g=b64("__GRY__"), N=__N__, R=__EXTENT__;
+const col=new Float32Array(N*3);   // g holds N*3 bytes: r,g,b per point
+for(let i=0;i<3*N;i++){col[i]=g[i]/255;}
+const scene=new THREE.Scene(); scene.background=new THREE.Color(0x000000);
+const cam=new THREE.PerspectiveCamera(60,innerWidth/innerHeight,0.01,R*20);
+const START=new THREE.Vector3(__START__);   // where the scan began, looking the way the camera did
+cam.position.copy(START);
+const ren=new THREE.WebGLRenderer({antialias:true}); ren.setSize(innerWidth,innerHeight);
+ren.setPixelRatio(Math.min(devicePixelRatio,2));
+document.body.appendChild(ren.domElement);
+const ctl=new THREE.OrbitControls(cam,ren.domElement); ctl.enableDamping=true;
+ctl.target.copy(START).add(new THREE.Vector3(1,0,0)); ctl.update();   // look 1 m ahead of the start
+const geo=new THREE.BufferGeometry();
+geo.setAttribute('position',new THREE.BufferAttribute(pos,3));
+geo.setAttribute('color',new THREE.BufferAttribute(col,3));
+const mat=new THREE.PointsMaterial({size:0.02,vertexColors:true,sizeAttenuation:true});
+scene.add(new THREE.Points(geo,mat));
+function setFog(a){ scene.fog = a>0 ? new THREE.Fog(0x000000, R*0.3, R*(3.2-2.4*a)) : null; }
+setFog(0);
+const ps=document.getElementById('ps'), fg=document.getElementById('fog');
+ps.oninput=()=>{mat.size=ps.value*0.008*Math.max(R/5,0.3);};
+fg.oninput=()=>setFog(parseFloat(fg.value));
+ps.oninput();
+
+// ---------- measuring ----------
+const PICK_RADIUS_PX=14, CLUSTER_M=0.04;
+let measuring=false, pending=null, items=[];   // items: {a,b,line,mk,label,dist}
+const mbtn=document.getElementById('mbtn'), help=document.getElementById('help'),
+      list=document.getElementById('list'), cross=document.getElementById('cross');
+const markerMat=new THREE.PointsMaterial({color:0xffaa00,size:12,sizeAttenuation:false,depthTest:false});
+const lineMat=new THREE.LineBasicMaterial({color:0xffaa00,depthTest:false});
+
+// Find the visible surface point under a screen position: all points within a few pixels,
+// the front-most cluster of them is averaged (reduces depth noise).
+function pick(mx,my){
+  cam.updateMatrixWorld();
+  const m=new THREE.Matrix4().multiplyMatrices(cam.projectionMatrix,cam.matrixWorldInverse).elements;
+  const W=innerWidth,H=innerHeight,r2=PICK_RADIUS_PX*PICK_RADIUS_PX;
+  const idx=[],dep=[]; let dmin=Infinity;
+  for(let i=0;i<N;i++){
+    const x=pos[3*i],y=pos[3*i+1],z=pos[3*i+2];
+    const w=m[3]*x+m[7]*y+m[11]*z+m[15]; if(w<=0.05) continue;
+    const sx=((m[0]*x+m[4]*y+m[8]*z+m[12])/w*0.5+0.5)*W;
+    const dx=sx-mx; if(dx*dx>r2) continue;
+    const sy=(1-((m[1]*x+m[5]*y+m[9]*z+m[13])/w*0.5+0.5))*H;
+    const dy=sy-my; if(dx*dx+dy*dy>r2) continue;
+    idx.push(i);dep.push(w); if(w<dmin) dmin=w;
+  }
+  if(!idx.length) return null;
+  let sx=0,sy=0,sz=0,c=0;
+  for(let k=0;k<idx.length;k++){ if(dep[k]<=dmin+CLUSTER_M){const i=idx[k];sx+=pos[3*i];sy+=pos[3*i+1];sz+=pos[3*i+2];c++;} }
+  return new THREE.Vector3(sx/c,sy/c,sz/c);
+}
+function toScreen(v){
+  const p=v.clone().project(cam);
+  return {x:(p.x*0.5+0.5)*innerWidth, y:(1-(p.y*0.5+0.5))*innerHeight, ok:p.z<1&&p.z>-1};
+}
+function fmt(d){ return d>=1 ? d.toFixed(3)+' m' : (d*100).toFixed(1)+' cm'; }
+function addMarker(p){
+  const gm=new THREE.BufferGeometry().setFromPoints([p]);
+  const mk=new THREE.Points(gm,markerMat); mk.renderOrder=10; scene.add(mk); return mk;
+}
+function refreshList(){
+  list.innerHTML=items.map((it,i)=>{
+    const dh=Math.hypot(it.b.x-it.a.x,it.b.z-it.a.z), dv=Math.abs(it.b.y-it.a.y);
+    return `<div><b>#${i+1}: ${fmt(it.dist)}</b><br><span style="color:#999">horizontal ${fmt(dh)} &middot; height ${fmt(dv)}</span></div>`;
+  }).join('');
+}
+function finish(a,b,markA){
+  const geoL=new THREE.BufferGeometry().setFromPoints([a,b]);
+  const line=new THREE.Line(geoL,lineMat); line.renderOrder=9; scene.add(line);
+  const mk=[markA,addMarker(b)];
+  const label=document.createElement('div'); label.className='lbl'; document.body.appendChild(label);
+  const dist=a.distanceTo(b); label.textContent=fmt(dist);
+  items.push({a,b,line,mk,label,dist}); refreshList();
+}
+function undo(){
+  if(pending){ scene.remove(pending.mk); pending=null; return; }
+  const it=items.pop(); if(!it) return;
+  scene.remove(it.line); it.mk.forEach(m=>scene.remove(m)); it.label.remove(); refreshList();
+}
+function clearAll(){ while(pending||items.length) undo(); }
+document.getElementById('undo').onclick=undo;
+document.getElementById('clear').onclick=clearAll;
+mbtn.onclick=()=>{
+  measuring=!measuring;
+  mbtn.textContent='Measure: '+(measuring?'ON':'off'); mbtn.classList.toggle('off',!measuring);
+  help.style.display=measuring?'block':'none';
+  document.body.classList.toggle('measure',measuring);
+  if(!measuring){ cross.style.display='none'; if(pending){scene.remove(pending.mk);pending=null;} }
+};
+// click (not drag) places a point
+let down=null;
+ren.domElement.addEventListener('pointerdown',e=>{down={x:e.clientX,y:e.clientY};});
+ren.domElement.addEventListener('pointerup',e=>{
+  if(!measuring||!down) return;
+  const moved=Math.hypot(e.clientX-down.x,e.clientY-down.y); down=null;
+  if(moved>5) return;
+  const p=pick(e.clientX,e.clientY); if(!p) return;
+  if(!pending){ pending={p,mk:addMarker(p)}; }
+  else { finish(pending.p,p,pending.mk); pending=null; }
+});
+// snapping crosshair while hovering
+let hoverQueued=false,hx=0,hy=0;
+ren.domElement.addEventListener('pointermove',e=>{
+  if(!measuring||e.buttons) {cross.style.display='none';return;}
+  hx=e.clientX;hy=e.clientY;
+  if(hoverQueued) return; hoverQueued=true;
+  requestAnimationFrame(()=>{
+    hoverQueued=false;
+    const p=pick(hx,hy);
+    if(!p){cross.style.display='none';return;}
+    const s=toScreen(p); cross.style.display='block'; cross.style.left=s.x+'px'; cross.style.top=s.y+'px';
+  });
+});
+function updateLabels(){
+  for(const it of items){
+    const mid=it.a.clone().add(it.b).multiplyScalar(0.5), s=toScreen(mid);
+    it.label.style.display=s.ok?'block':'none'; it.label.style.left=s.x+'px'; it.label.style.top=s.y+'px';
+  }
+}
+addEventListener('resize',()=>{cam.aspect=innerWidth/innerHeight;cam.updateProjectionMatrix();ren.setSize(innerWidth,innerHeight);});
+(function loop(){requestAnimationFrame(loop);ctl.update();ren.render(scene,cam);updateLabels();})();
+</script></body></html>
